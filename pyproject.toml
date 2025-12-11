@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fk_sync"                    
+version = "0.1.0"
+description = "FK Tool"
+readme = "README.md"
+requires-python = ">=3.9"
+
+authors = [
+  { name = "Valerio Belli", email = "valeriobelli26@gmail.com" }
+]
+
+dependencies = [
+  "numpy",
+  "pin>=3.0",       
+  "omegaconf>=2.0", 
+]
+
+[project.optional-dependencies]
+dev = [
+  "ruff",
+  "mypy",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
