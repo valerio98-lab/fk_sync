@@ -1,197 +1,282 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Literal
+from typing import Iterable, Optional, Sequence, Union
 
 import numpy as np
 
-from .config import load_skeleton_configs, SkeletonConfig
-from .kinematics import KinematicsModel
-from .simulators.base import SimulatorAdapter
-from .validation import validate_fk_against_sim, FkValidationStats
-from .dataset import augment_dataset_with_end_effectors
+try:
+    import pandas as pd
+except Exception:  # pragma: no cover
+    pd = None
+
+from fk_sync.config import load_skeleton_configs
+from fk_sync.kinematics import KinematicsModel
+from fk_sync.validation import ValidationReport, validate_fk_against_sim
+
+
+# DeepMimic end-effectors: left/right foot + left/right hand
+DEEPMIMIC_END_EFFECTORS_G1 = [
+    "left_ankle_roll_link",
+    "right_ankle_roll_link",
+    "left_hand_palm_link",
+    "right_hand_palm_link",
+]
+
+
+def _collect_csvs(dataset_root: Path, pattern: str = "**/*.csv") -> list[Path]:
+    dataset_root = Path(dataset_root)
+    paths = sorted(dataset_root.glob(pattern))
+    if not paths:
+        raise FileNotFoundError(
+            f"Nessun CSV trovato in {dataset_root} con pattern='{pattern}'."
+        )
+    return paths
+
+
+def _infer_joint_columns(
+    df_columns: Sequence[str], joint_order: Sequence[str]
+) -> list[str]:
+    cols = list(df_columns)
+
+    # 1) colonne = nomi joint
+    if all(j in cols for j in joint_order):
+        return list(joint_order)
+
+    # 2) pattern comuni: q0..qN, q_0..q_N, joint0..jointN, j0..jN
+    for prefix in ("q", "q_", "joint", "j"):
+        tmp = []
+        for k in range(len(joint_order)):
+            name = f"{prefix}{k}"
+            if name in cols:
+                tmp.append(name)
+        if len(tmp) == len(joint_order):
+            return tmp
+
+    raise ValueError(
+        "Non riesco a inferire le colonne delle joint dal CSV.\n"
+        "Supporto:\n"
+        " - colonne con nomi identici a joint_order (consigliato)\n"
+        " - q0..qN / q_0..q_N / joint0..jointN / j0..jN\n"
+        f"Prime colonne viste: {cols[:20]}"
+    )
+
+
+def _iter_q_samples(
+    csv_paths: Sequence[Path],
+    joint_order: Sequence[str],
+    n_samples: int,
+    seed: int = 0,
+    max_rows_per_file: int = 512,
+) -> Iterable[np.ndarray]:
+    if pd is None:
+        raise ImportError("Serve pandas per leggere i CSV (pip install pandas).")
+
+    rng = np.random.default_rng(seed)
+    remaining = n_samples
+
+    csv_paths = list(csv_paths)
+    rng.shuffle(csv_paths)
+
+    for p in csv_paths:
+        if remaining <= 0:
+            break
+
+        df = pd.read_csv(p)
+        if len(df) == 0:
+            continue
+
+        joint_cols = _infer_joint_columns(df.columns, joint_order)
+        take = min(len(df), max_rows_per_file, remaining)
+
+        if take < len(df):
+            idx = rng.choice(len(df), size=take, replace=False)
+            df_s = df.iloc[idx]
+        else:
+            df_s = df.iloc[:take]
+
+        q_mat = df_s[joint_cols].to_numpy(dtype=float, copy=True)
+        for i in range(q_mat.shape[0]):
+            yield q_mat[i]
+            remaining -= 1
+            if remaining <= 0:
+                break
 
 
 @dataclass
-class FkToolConfig:
-    dataset_yaml: str | Path
-    urdf_path: str | Path
-    skeleton_name: str               # es. "g1", "h1_2", "h1"
-    error_threshold: float = 1e-3
-    use_pinocchio_in_simulation: bool = False  # se True: niente mismatch, Pinocchio ovunque
-    default_frame: Literal["world", "root"] = "root"
-
-
 class FkTool:
-    """
-    Entry-point principale.
+    robots_yaml: Path
+    urdf_for_kinematics: Path
+    skeleton_name: str = "g1"
+    root_frame_name: Optional[str] = None
 
-    - Carica la config dello scheletro dal YAML.
-    - Costruisce il KinematicsModel (Pinocchio).
-    - Permette di:
-        * validare la FK contro un simulatore (se fornito un adapter)
-        * scegliere la sorgente FK ("internal" vs "simulator")
-        * arricchire un dataset con posizioni EE.
-    """
+    kin: Optional[KinematicsModel] = None
+    sim_adapter: Optional[object] = None
+    fk_source: str = "internal"  # "internal" | "simulator"
 
-    def __init__(self, cfg: FkToolConfig) -> None:
-        self.cfg = cfg
-        self._skeletons = load_skeleton_configs(cfg.dataset_yaml)
-        if cfg.skeleton_name not in self._skeletons:
-            raise KeyError(f"Skeleton '{cfg.skeleton_name}' non trovato in {cfg.dataset_yaml}.")
-        self.skel: SkeletonConfig = self._skeletons[cfg.skeleton_name]
+    def __post_init__(self):
+        self.robots_yaml = Path(self.robots_yaml)
+        self.urdf_for_kinematics = Path(self.urdf_for_kinematics)
 
-        self.kin_model = KinematicsModel.from_urdf(
-            urdf_path=str(cfg.urdf_path),
-            joint_order=self.skel.joint_order,
-            root_frame_name=None,  # se vuoi puoi passare qualcosa tipo "pelvis"
+        skeletons = load_skeleton_configs(self.robots_yaml)
+        if self.skeleton_name not in skeletons:
+            raise KeyError(
+                f"Skeleton '{self.skeleton_name}' non trovato in {self.robots_yaml}."
+            )
+        skel = skeletons[self.skeleton_name]
+
+        self.kin = KinematicsModel.from_urdf(
+            urdf_path=str(self.urdf_for_kinematics),
+            joint_order=skel.joint_order,
+            root_frame_name=self.root_frame_name,
         )
 
-        self.sim_adapter: Optional[SimulatorAdapter] = None
-        self.which_simulator: Optional[str] = None
-
-        # "internal" -> KinematicsModel (Pinocchio)
-        # "simulator" -> SimulatorAdapter
-        self.fk_source: Literal["internal", "simulator"] = "internal"
-
-    # -----------------------------
-    # Simulator attachment & validation
-    # -----------------------------
-
-    def attach_simulator(
-        self,
-        which_simulator: str,
-        adapter: SimulatorAdapter,
-    ) -> None:
-        self.which_simulator = which_simulator
+    def attach_simulator(self, which_simulator: str, adapter: object) -> "FkTool":
+        if which_simulator.lower() != "isaaclab":
+            raise ValueError("Al momento supporto solo which_simulator='isaaclab'.")
         self.sim_adapter = adapter
+        return self
+
+    def set_fk_source(self, source: str) -> None:
+        source = source.lower().strip()
+        if source not in ("internal", "simulator"):
+            raise ValueError("fk_source deve essere 'internal' oppure 'simulator'.")
+        if source == "simulator" and self.sim_adapter is None:
+            raise RuntimeError(
+                "fk_source='simulator' ma non hai attaccato il simulator adapter."
+            )
+        self.fk_source = source
 
     def validate_fk_against_sim(
         self,
-        end_effectors: List[str],
-        num_samples: int = 128,
-        q_min: float = -1.0,
-        q_max: float = 1.0,
-        frame: Optional[str] = None,
-    ) -> FkValidationStats:
-        """
-        Esegue il confronto FK interna vs simulatore su campioni random uniformi
-        tra q_min e q_max per ogni DOF (puoi cambiare logica in futuro).
-
-        Restituisce un FkValidationStats con mean/max/std per ogni EE.
-        """
+        dataset_root: Union[str, Path],
+        end_effectors: Optional[Sequence[str]] = None,
+        n_samples: int = 200,
+        csv_glob: str = "**/*.csv",
+        frame: str = "root",
+        pos_threshold: float = 1e-3,
+        ang_threshold_rad: float = 1e-2,
+        seed: int = 0,
+        auto_select_fk_source: bool = True,
+    ) -> ValidationReport:
+        if self.kin is None:
+            raise RuntimeError("KinematicsModel non inizializzato.")
         if self.sim_adapter is None:
-            raise RuntimeError("Nessun simulator adapter collegato. Chiama attach_simulator().")
+            raise RuntimeError("Prima devi fare attach_simulator(...).")
 
-        frame = frame or self.cfg.default_frame
-        dof = self.kin_model.dof
-        q_samples = np.random.uniform(low=q_min, high=q_max, size=(num_samples, dof))
+        dataset_root = Path(dataset_root)
+        csvs = _collect_csvs(dataset_root, csv_glob)
 
-        stats = validate_fk_against_sim(
-            kin_model=self.kin_model,
+        q_samples = list(
+            _iter_q_samples(csvs, self.kin.joint_order, n_samples=n_samples, seed=seed)
+        )
+        ee = (
+            list(end_effectors)
+            if end_effectors is not None
+            else list(DEEPMIMIC_END_EFFECTORS_G1)
+        )
+
+        report = validate_fk_against_sim(
+            kin=self.kin,
             sim_adapter=self.sim_adapter,
-            end_effectors=end_effectors,
             q_samples=q_samples,
+            link_names=ee,
             frame=frame,
-        )
-        return stats
-
-    def auto_select_fk_source(
-        self,
-        end_effectors: List[str],
-        num_samples: int = 128,
-        q_min: float = -1.0,
-        q_max: float = 1.0,
-    ) -> Optional[FkValidationStats]:
-        """
-        Logica "smart":
-        - Se use_pinocchio_in_simulation=True: resta su "internal", non fa check.
-        - Se False e c'è un simulatore:
-            * calcola stats
-            * se max_error > error_threshold -> propone di usare "simulator"
-              (qui per ora setta direttamente fk_source="simulator" se adapter esiste).
-        """
-        if self.cfg.use_pinocchio_in_simulation:
-            self.fk_source = "internal"
-            return None
-
-        if self.sim_adapter is None:
-            # nessun simulatore: rimaniamo su internal, ma non c'è niente da validare
-            self.fk_source = "internal"
-            return None
-
-        stats = self.validate_fk_against_sim(
-            end_effectors=end_effectors,
-            num_samples=num_samples,
-            q_min=q_min,
-            q_max=q_max,
+            pos_threshold=pos_threshold,
+            ang_threshold_rad=ang_threshold_rad,
         )
 
-        max_err = max(stats.per_link_max.values())
-        if max_err > self.cfg.error_threshold:
-            # mismatch alto: passiamo a usare la FK del simulatore
-            self.fk_source = "simulator"
-        else:
-            self.fk_source = "internal"
+        if auto_select_fk_source:
+            self.fk_source = "internal" if report.ok else "simulator"
 
-        return stats
-
-    def set_fk_source(self, source: Literal["internal", "simulator"]) -> None:
-        if source == "simulator" and self.sim_adapter is None:
-            raise RuntimeError("fk_source='simulator' ma nessun simulator adapter è collegato.")
-        self.fk_source = source
-
-    # -----------------------------
-    # Dataset augmentation
-    # -----------------------------
+        return report
 
     def augment_dataset(
         self,
-        input_path: str | Path,
-        output_path: str | Path,
-        end_effectors: List[str],
-        frame: Optional[str] = None,
-        add_orientation: bool = False,
-        ee_prefix: str = "ee",
-    ) -> None:
+        dataset_root: Union[str, Path],
+        out_root: Optional[Union[str, Path]] = None,
+        end_effectors: Optional[Sequence[str]] = None,
+        csv_glob: str = "**/*.csv",
+        frame: str = "root",
+        chunksize: int = 5000,
+    ) -> Path:
         """
-        Arricchisce un dataset CSV con colonne di posizioni (e opz. orientazioni)
-        degli end-effector usando la sorgente FK scelta (internal vs simulator).
+        Crea una cartella *_aug e salva CSV con colonne aggiuntive:
+          <ee>_px, <ee>_py, <ee>_pz, <ee>_qw, <ee>_qx, <ee>_qy, <ee>_qz
 
-        Per ora:
-        - "internal" usa KinematicsModel.fk
-        - "simulator" è TODO (richiederà un piccolo wrapper che espone fk(...) con stessa firma).
+        Nota: se fk_source='simulator' sarà MOLTO più lento (serve step sim per frame).
         """
-        frame = frame or self.cfg.default_frame
-        source = self.fk_source
+        if pd is None:
+            raise ImportError(
+                "Serve pandas per leggere/scrivere i CSV (pip install pandas)."
+            )
+        if self.kin is None:
+            raise RuntimeError("KinematicsModel non inizializzato.")
 
-        if source == "internal":
-            fk_provider = self.kin_model
-        elif source == "simulator":
-            if self.sim_adapter is None:
-                raise RuntimeError("fk_source='simulator' ma nessun simulator adapter è collegato.")
+        dataset_root = Path(dataset_root)
+        csvs = _collect_csvs(dataset_root, csv_glob)
 
-            # Wrap minimal per adattare SimulatorAdapter all'interfaccia fk_provider
-            class _SimFkProvider:
-                def __init__(self, adapter: SimulatorAdapter):
-                    self._adapter = adapter
+        if out_root is None:
+            out_root = dataset_root.parent / f"{dataset_root.name}_aug"
+        out_root = Path(out_root)
+        out_root.mkdir(parents=True, exist_ok=True)
 
-                def fk(self, q, link_names, frame="root"):
-                    self._adapter.set_q(q)
-                    return self._adapter.get_link_poses(link_names, frame=frame)
-
-            fk_provider = _SimFkProvider(self.sim_adapter)
-        else:
-            raise ValueError(f"Sorgente FK sconosciuta: {source}")
-
-        augment_dataset_with_end_effectors(
-            input_path=input_path,
-            output_path=output_path,
-            fk_provider=fk_provider,
-            joint_order=self.skel.joint_order,
-            end_effectors=end_effectors,
-            frame=frame,  # "world" o "root"
-            add_orientation=add_orientation,
-            ee_prefix=ee_prefix,
+        ee = (
+            list(end_effectors)
+            if end_effectors is not None
+            else list(DEEPMIMIC_END_EFFECTORS_G1)
         )
+
+        first_df = pd.read_csv(csvs[0], nrows=1)
+        joint_cols = _infer_joint_columns(first_df.columns, self.kin.joint_order)
+
+        for src in csvs:
+            rel = src.relative_to(dataset_root)
+            dst = out_root / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+
+            header_written = False
+
+            for chunk in pd.read_csv(src, chunksize=chunksize):
+                q_mat = chunk[joint_cols].to_numpy(dtype=float, copy=False)
+
+                # prealloc nuove colonne
+                new_cols = {}
+                for name in ee:
+                    for ax in ("x", "y", "z"):
+                        new_cols[f"{name}_p{ax}"] = np.zeros(len(chunk), dtype=float)
+                    for ax in ("w", "x", "y", "z"):
+                        new_cols[f"{name}_q{ax}"] = np.zeros(len(chunk), dtype=float)
+
+                for i in range(len(chunk)):
+                    q = q_mat[i]
+
+                    if self.fk_source == "internal":
+                        fk = self.kin.fk(q, list(ee), frame=frame)
+                    else:
+                        if self.sim_adapter is None:
+                            raise RuntimeError(
+                                "fk_source='simulator' ma sim_adapter è None."
+                            )
+                        fk = self.sim_adapter.fk(
+                            q, self.kin.joint_order, list(ee), frame=frame
+                        )
+
+                    for name in ee:
+                        pos, quat = fk[name]
+                        new_cols[f"{name}_px"][i] = float(pos[0])
+                        new_cols[f"{name}_py"][i] = float(pos[1])
+                        new_cols[f"{name}_pz"][i] = float(pos[2])
+                        new_cols[f"{name}_qw"][i] = float(quat[0])
+                        new_cols[f"{name}_qx"][i] = float(quat[1])
+                        new_cols[f"{name}_qy"][i] = float(quat[2])
+                        new_cols[f"{name}_qz"][i] = float(quat[3])
+
+                for k, v in new_cols.items():
+                    chunk[k] = v
+
+                chunk.to_csv(dst, index=False, mode="a", header=not header_written)
+                header_written = True
+
+        return out_root
